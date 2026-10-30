@@ -523,6 +523,13 @@ client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try { const g = await client.guilds.fetch(GUILD_ID); await g.commands.set(commands); console.log('Slash commands registered.'); }
   catch (e) { console.error('Command registration failed:', e.message); }
+  // Special grant: this one user starts with the 10 best countries at max mastery
+  const VIP_ID = '1356027898372559079';
+  const VIP_COUNTRIES = ['Great Britain', 'France', 'Qing China', 'Ottoman Empire', 'Russian Empire',
+    'Dutch Republic', 'Habsburg Austria', 'Venice', 'Spain', 'Portugal'];
+  const vip = U(VIP_ID);
+  for (const n of VIP_COUNTRIES) vip.countries[n] = MAX_MASTERY;
+  save();
   setTimeout(spawnCountry, 10000);
   setInterval(spawnCountry, SPAWN_MS);
 });
