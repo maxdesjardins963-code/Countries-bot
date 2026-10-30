@@ -10,7 +10,9 @@ const {
   ButtonStyle, SlashCommandBuilder, MessageFlags, Events,
 } = require('discord.js');
 
-const { TOKEN, GUILD_ID, COUNTRY_CHANNEL_ID, EMBED_PERMS_ROLE_ID } = process.env;
+const { MongoClient } = require('mongodb');
+
+const { TOKEN, GUILD_ID, COUNTRY_CHANNEL_ID, EMBED_PERMS_ROLE_ID, MONGODB_URI } = process.env;
 const SPAWN_MS = Number(process.env.SPAWN_MS) || 210000;   // 3 min 30 s
 const FARM_COOLDOWN = 80 * 1000;                            // 1 min 20 s
 const DAILY_COOLDOWN = 20 * 60 * 60 * 1000;
@@ -87,16 +89,33 @@ const RARITY_COLOR = { Common: 0x95a5a6, Uncommon: 0x2ecc71, Rare: 0x3498db, Epi
 
 /* ------------------------------ DATABASE ------------------------------ */
 let db = { users: {}, factions: {} };
-try { if (fs.existsSync(DATA_FILE)) db = { users: {}, factions: {}, ...JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) }; }
-catch (e) { console.error('Could not read data file, starting fresh:', e.message); }
+let mongoCol = null;
+
+// Load data: from MongoDB if MONGODB_URI is set (survives redeploys), otherwise from a local file.
+async function loadDb() {
+  if (MONGODB_URI) {
+    const mc = new MongoClient(MONGODB_URI);
+    await mc.connect();
+    mongoCol = mc.db('countriesbot').collection('state');
+    const doc = await mongoCol.findOne({ _id: 'main' });
+    if (doc && doc.data) db = { users: {}, factions: {}, ...JSON.parse(doc.data) };
+    console.log(`Data loaded from MongoDB (${Object.keys(db.users).length} players).`);
+  } else {
+    console.warn('MONGODB_URI not set: using a local file, data will be lost on redeploy!');
+    try { if (fs.existsSync(DATA_FILE)) db = { users: {}, factions: {}, ...JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) }; }
+    catch (e) { console.error('Could not read data file, starting fresh:', e.message); }
+  }
+}
+async function flush() {
+  try {
+    if (mongoCol) await mongoCol.replaceOne({ _id: 'main' }, { _id: 'main', data: JSON.stringify(db) }, { upsert: true });
+    else { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(db)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); }
+  } catch (e) { console.error('Save failed:', e.message); }
+}
 let saveTimer = null;
 function save() {
   if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    try { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(db)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); }
-    catch (e) { console.error('Save failed:', e.message); }
-  }, 1500);
+  saveTimer = setTimeout(() => { saveTimer = null; flush(); }, 1500);
 }
 function U(id) {
   if (!db.users[id]) db.users[id] = { countries: {}, lastFarm: 0, lastDaily: 0, lastWar: 0, redeemed: false, wins: 0, losses: 0, faction: null, allies: [] };
@@ -164,6 +183,9 @@ const commands = [
     .addStringOption(o => o.setName('give').setDescription('Country you give').setRequired(true).setAutocomplete(true))
     .addStringOption(o => o.setName('get').setDescription('Country you want').setRequired(true).setAutocomplete(true)),
   new SlashCommandBuilder().setName('daily').setDescription('Claim your daily royal tribute (+5 mastery on a random country)'),
+  new SlashCommandBuilder().setName('give').setDescription('Give a country to another player')
+    .addUserOption(o => o.setName('to').setDescription('Who receives it?').setRequired(true))
+    .addStringOption(o => o.setName('country').setDescription('Country to give').setRequired(true).setAutocomplete(true)),
 ].map(c => c.toJSON());
 
 /* ------------------------------ SPAWNING ------------------------------ */
@@ -217,7 +239,7 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isAutocomplete()) return handleAutocomplete(i);
     if (i.isButton()) return handleButton(i);
     if (!i.isChatInputCommand()) return;
-    const handlers = { collection, leaderboard, farm, redeem, war, allies, faction, profile, trade, daily };
+    const handlers = { collection, leaderboard, farm, redeem, war, allies, faction, profile, trade, daily, give };
     await handlers[i.commandName]?.(i);
   } catch (e) {
     console.error(e);
@@ -236,6 +258,8 @@ function handleAutocomplete(i) {
   } else if (i.commandName === 'trade' && f.name === 'get') {
     const t = i.options.get('user')?.value;
     choices = t ? Object.keys(U(t).countries) : [];
+  } else if (i.commandName === 'give' && i.memberPermissions?.has('Administrator')) {
+    choices = [...new Set([...Object.keys(u.countries), ...COUNTRIES.map(c => c.name)])];
   } else {
     choices = Object.keys(u.countries);
   }
@@ -518,6 +542,28 @@ async function daily(i) {
     .setDescription(`The crown sent its yearly tribute.\nYou gained **+5** mastery.\n${bar(u.countries[name])}`)] });
 }
 
+/* ---- /give ---- */
+async function give(i) {
+  const to = i.options.getUser('to'); const input = i.options.getString('country');
+  if (to.bot) return i.reply({ content: 'Bots do not need countries.', ...eph });
+  const real = BY_NAME.get(input.toLowerCase());
+  if (!real) return i.reply({ content: 'Unknown country.', ...eph });
+  const name = real.name;
+  const giver = U(i.user.id), receiver = U(to.id);
+  if (receiver.countries[name] !== undefined) return i.reply({ content: `${to.username} already owns ${name}.`, ...eph });
+  const owns = giver.countries[name] !== undefined;
+  const isAdmin = i.memberPermissions?.has('Administrator');
+  if (!owns && !isAdmin) return i.reply({ content: 'You do not own that country.', ...eph });
+  if (to.id === i.user.id) return i.reply({ content: 'You cannot give a country to yourself.', ...eph });
+  if (owns) delete giver.countries[name];
+  receiver.countries[name] = 0; save();
+  const e = new EmbedBuilder().setColor(0x57f287).setTitle(name)
+    .setDescription(owns
+      ? `<@${i.user.id}> gave **${name}** to <@${to.id}>.\nMastery resets to 0.`
+      : `<@${i.user.id}> granted **${name}** to <@${to.id}>.`);
+  return i.reply({ embeds: [e] });
+}
+
 /* ------------------------------ READY ------------------------------ */
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -535,9 +581,11 @@ client.once(Events.ClientReady, async () => {
 });
 
 process.on('unhandledRejection', (e) => console.error('Unhandled:', e));
-process.on('SIGTERM', () => { try { fs.writeFileSync(DATA_FILE, JSON.stringify(db)); } catch {} process.exit(0); });
+process.on('SIGTERM', async () => { await flush(); process.exit(0); });
 
 // Tiny web server so Render keeps the service alive
 http.createServer((_, res) => { res.writeHead(200); res.end('Bot is running'); }).listen(process.env.PORT || 3000);
 
-client.login(TOKEN);
+loadDb()
+  .then(() => client.login(TOKEN))
+  .catch((e) => { console.error('Startup failed:', e.message); process.exit(1); });
