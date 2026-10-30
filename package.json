@@ -1,16 +1,15 @@
 {
-  "name": "countries-discord-bot",
+  "name": "empire-countries-bot",
   "version": "1.0.0",
-  "description": "A Discord country collection and strategy game bot",
+  "description": "Discord bot: collect countries from 1750, farm mastery, wage wars, form alliances and factions.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=18.17.0"
+    "node": ">=18"
   },
   "dependencies": {
-    "discord.js": "^14.27.0",
-    "dotenv": "^16.4.7"
+    "discord.js": "^14.16.3"
   }
 }
