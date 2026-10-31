@@ -7,12 +7,12 @@ const fs = require('fs');
 const http = require('http');
 const {
   Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder,
-  ButtonStyle, SlashCommandBuilder, MessageFlags, Events,
+  ButtonStyle, SlashCommandBuilder, MessageFlags, Events, AttachmentBuilder,
 } = require('discord.js');
 
-const { MongoClient } = require('mongodb');
-
-const { TOKEN, GUILD_ID, COUNTRY_CHANNEL_ID, EMBED_PERMS_ROLE_ID, MONGODB_URI } = process.env;
+const { TOKEN, GUILD_ID, COUNTRY_CHANNEL_ID, EMBED_PERMS_ROLE_ID } = process.env;
+const BACKUP_CHANNEL_ID = process.env.BACKUP_CHANNEL_ID || '1564234091111649411';
+const BACKUP_MS = 90 * 60 * 1000; // every 1h30
 const SPAWN_MS = Number(process.env.SPAWN_MS) || 210000;   // 3 min 30 s
 const FARM_COOLDOWN = 80 * 1000;                            // 1 min 20 s
 const DAILY_COOLDOWN = 20 * 60 * 60 * 1000;
@@ -89,33 +89,45 @@ const RARITY_COLOR = { Common: 0x95a5a6, Uncommon: 0x2ecc71, Rare: 0x3498db, Epi
 
 /* ------------------------------ DATABASE ------------------------------ */
 let db = { users: {}, factions: {} };
-let mongoCol = null;
+let restored = false;   // true once the last backup has been loaded (or none exists)
+let dirty = false;      // true when data changed since the last backup
+function save() { dirty = true; }
 
-// Load data: from MongoDB if MONGODB_URI is set (survives redeploys), otherwise from a local file.
-async function loadDb() {
-  if (MONGODB_URI) {
-    const mc = new MongoClient(MONGODB_URI);
-    await mc.connect();
-    mongoCol = mc.db('countriesbot').collection('state');
-    const doc = await mongoCol.findOne({ _id: 'main' });
-    if (doc && doc.data) db = { users: {}, factions: {}, ...JSON.parse(doc.data) };
-    console.log(`Data loaded from MongoDB (${Object.keys(db.users).length} players).`);
-  } else {
-    console.warn('MONGODB_URI not set: using a local file, data will be lost on redeploy!');
-    try { if (fs.existsSync(DATA_FILE)) db = { users: {}, factions: {}, ...JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) }; }
-    catch (e) { console.error('Could not read data file, starting fresh:', e.message); }
+// Backups live in a Discord channel as JSON files, so they survive redeploys.
+async function restoreBackup() {
+  for (let attempt = 1; attempt <= 3 && !restored; attempt++) {
+    try {
+      const ch = await client.channels.fetch(BACKUP_CHANNEL_ID);
+      const msgs = await ch.messages.fetch({ limit: 50 });
+      const m = msgs.filter(x => x.author.id === client.user.id && x.attachments.size && x.attachments.first().name.startsWith('backup')).first();
+      if (m) {
+        const res = await fetch(m.attachments.first().url);
+        db = { users: {}, factions: {}, ...(await res.json()) };
+        console.log(`Backup restored (${Object.keys(db.users).length} players).`);
+      } else console.log('No backup found, starting fresh.');
+      restored = true;
+    } catch (e) {
+      console.error(`Restore attempt ${attempt} failed:`, e.message);
+      await new Promise(r => setTimeout(r, 3000));
+    }
   }
+  if (!restored) { console.error('Could not read the backup channel. Stopping to avoid overwriting your data.'); process.exit(1); }
 }
-async function flush() {
+async function doBackup(force = false) {
+  if (!restored || (!dirty && !force)) return false;
   try {
-    if (mongoCol) await mongoCol.replaceOne({ _id: 'main' }, { _id: 'main', data: JSON.stringify(db) }, { upsert: true });
-    else { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(db)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); }
-  } catch (e) { console.error('Save failed:', e.message); }
-}
-let saveTimer = null;
-function save() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => { saveTimer = null; flush(); }, 1500);
+    const ch = await client.channels.fetch(BACKUP_CHANNEL_ID);
+    const name = `backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    const file = new AttachmentBuilder(Buffer.from(JSON.stringify(db)), { name });
+    await ch.send({ content: `Backup: ${Object.keys(db.users).length} players, ${Object.keys(db.factions).length} factions`, files: [file] });
+    dirty = false;
+    try { // keep only the 5 latest backups
+      const msgs = await ch.messages.fetch({ limit: 50 });
+      const mine = [...msgs.filter(x => x.author.id === client.user.id && x.attachments.size).values()];
+      for (const old of mine.slice(5)) await old.delete();
+    } catch {}
+    return true;
+  } catch (e) { console.error('Backup failed:', e.message); return false; }
 }
 function U(id) {
   if (!db.users[id]) db.users[id] = { countries: {}, lastFarm: 0, lastDaily: 0, lastWar: 0, redeemed: false, wins: 0, losses: 0, faction: null, allies: [] };
@@ -186,6 +198,7 @@ const commands = [
   new SlashCommandBuilder().setName('give').setDescription('Give a country to another player')
     .addUserOption(o => o.setName('to').setDescription('Who receives it?').setRequired(true))
     .addStringOption(o => o.setName('country').setDescription('Country to give').setRequired(true).setAutocomplete(true)),
+  new SlashCommandBuilder().setName('backup').setDescription('Admins only: save all player data now'),
 ].map(c => c.toJSON());
 
 /* ------------------------------ SPAWNING ------------------------------ */
@@ -239,7 +252,7 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isAutocomplete()) return handleAutocomplete(i);
     if (i.isButton()) return handleButton(i);
     if (!i.isChatInputCommand()) return;
-    const handlers = { collection, leaderboard, farm, redeem, war, allies, faction, profile, trade, daily, give };
+    const handlers = { collection, leaderboard, farm, redeem, war, allies, faction, profile, trade, daily, give, backup };
     await handlers[i.commandName]?.(i);
   } catch (e) {
     console.error(e);
@@ -542,6 +555,14 @@ async function daily(i) {
     .setDescription(`The crown sent its yearly tribute.\nYou gained **+5** mastery.\n${bar(u.countries[name])}`)] });
 }
 
+/* ---- /backup ---- */
+async function backup(i) {
+  if (!i.memberPermissions?.has('Administrator')) return i.reply({ content: 'Admins only.', ...eph });
+  await i.deferReply(eph);
+  const ok = await doBackup(true);
+  return i.editReply(ok ? 'Backup sent to the backup channel.' : 'Backup failed, check the logs.');
+}
+
 /* ---- /give ---- */
 async function give(i) {
   const to = i.options.getUser('to'); const input = i.options.getString('country');
@@ -567,21 +588,19 @@ async function give(i) {
 /* ------------------------------ READY ------------------------------ */
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  await restoreBackup();
   try { const g = await client.guilds.fetch(GUILD_ID); await g.commands.set(commands); console.log('Slash commands registered.'); }
   catch (e) { console.error('Command registration failed:', e.message); }
-  // Special grant: this one user starts with the 10 best countries at max mastery
-  const VIP_ID = '1356027898372559079';
-  const VIP_COUNTRIES = ['Great Britain', 'France', 'Qing China', 'Ottoman Empire', 'Russian Empire',
-    'Dutch Republic', 'Habsburg Austria', 'Venice', 'Spain', 'Portugal'];
-  const vip = U(VIP_ID);
-  for (const n of VIP_COUNTRIES) vip.countries[n] = MAX_MASTERY;
-  save();
+  setInterval(() => doBackup(), BACKUP_MS);
   setTimeout(spawnCountry, 10000);
   setInterval(spawnCountry, SPAWN_MS);
 });
 
 process.on('unhandledRejection', (e) => console.error('Unhandled:', e));
-process.on('SIGTERM', async () => { await flush(); process.exit(0); });
+process.on('SIGTERM', async () => {
+  try { await Promise.race([doBackup(), new Promise(r => setTimeout(r, 5000))]); } catch {}
+  process.exit(0);
+});
 
 // Tiny web server so Render keeps the service alive
 http.createServer((_, res) => { res.writeHead(200); res.end('Bot is running'); }).listen(process.env.PORT || 3000);
@@ -591,6 +610,11 @@ if (process.env.RENDER_EXTERNAL_URL) {
   setInterval(() => { fetch(process.env.RENDER_EXTERNAL_URL).catch(() => {}); }, 4 * 60 * 1000);
 }
 
-loadDb()
-  .then(() => client.login(TOKEN))
-  .catch((e) => { console.error('Startup failed:', e.message); process.exit(1); });
+client.on(Events.Error, (e) => console.error('Client error:', e.message));
+client.on(Events.ShardError, (e) => console.error('Shard error:', e.message));
+client.on(Events.ShardDisconnect, (ev) => console.warn('Shard disconnected, code', ev.code));
+client.on(Events.Warn, (m) => console.warn('Warn:', m));
+setTimeout(() => { if (!client.isReady()) console.error('Still not connected to Discord after 60s.'); }, 60000);
+
+console.log('Connecting to Discord...');
+client.login(TOKEN).catch((e) => { console.error('Startup failed:', e.message); process.exit(1); });
