@@ -586,6 +586,11 @@ process.on('SIGTERM', async () => { await flush(); process.exit(0); });
 // Tiny web server so Render keeps the service alive
 http.createServer((_, res) => { res.writeHead(200); res.end('Bot is running'); }).listen(process.env.PORT || 3000);
 
+// Extra keep-alive ping (Render sets RENDER_EXTERNAL_URL). An external pinger like UptimeRobot is still recommended.
+if (process.env.RENDER_EXTERNAL_URL) {
+  setInterval(() => { fetch(process.env.RENDER_EXTERNAL_URL).catch(() => {}); }, 4 * 60 * 1000);
+}
+
 loadDb()
   .then(() => client.login(TOKEN))
   .catch((e) => { console.error('Startup failed:', e.message); process.exit(1); });
