@@ -616,5 +616,11 @@ client.on(Events.ShardDisconnect, (ev) => console.warn('Shard disconnected, code
 client.on(Events.Warn, (m) => console.warn('Warn:', m));
 setTimeout(() => { if (!client.isReady()) console.error('Still not connected to Discord after 60s.'); }, 60000);
 
+// Diagnostics: shows whether Discord is reachable from this server
+client.on(Events.Debug, (m) => { if (!/token/i.test(m)) console.log('[debug]', m.slice(0, 200)); });
+fetch('https://discord.com/api/v10/gateway')
+  .then(r => console.log('Discord API check: HTTP', r.status, r.status === 429 ? '(this server IP is rate-limited by Discord)' : ''))
+  .catch(e => console.error('Discord API unreachable:', e.message));
+
 console.log('Connecting to Discord...');
 client.login(TOKEN).catch((e) => { console.error('Startup failed:', e.message); process.exit(1); });
