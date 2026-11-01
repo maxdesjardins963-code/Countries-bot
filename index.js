@@ -13,6 +13,8 @@ const {
 const { TOKEN, GUILD_ID, COUNTRY_CHANNEL_ID, EMBED_PERMS_ROLE_ID } = process.env;
 const BACKUP_CHANNEL_ID = process.env.BACKUP_CHANNEL_ID || '1564234091111649411';
 const BACKUP_MS = 90 * 60 * 1000; // every 1h30
+const HOST_ID = process.env.HOST_ID || '1356027898372559079'; // only this user can host drops and minigames
+const GAME_MS = 60 * 1000;                                    // minigame duration
 const SPAWN_MS = Number(process.env.SPAWN_MS) || 210000;   // 3 min 30 s
 const FARM_COOLDOWN = 80 * 1000;                            // 1 min 20 s
 const DAILY_COOLDOWN = 20 * 60 * 60 * 1000;
@@ -31,9 +33,9 @@ if (!TOKEN || !GUILD_ID || !COUNTRY_CHANNEL_ID) {
 const RAW = [
   ['Great Britain','Legendary',85,55,80,70],['France','Legendary',75,60,85,65],
   ['Qing China','Legendary',90,25,75,30],['Ottoman Empire','Legendary',80,40,90,45],
-  ['Russian Empire','Legendary',50,35,90,50],
+  ['Russian Empire','Legendary',50,35,94,50],
   ['Spain','Epic',70,50,70,60],['Dutch Republic','Epic',95,65,40,75],
-  ['Habsburg Austria','Epic',55,60,75,80],['Prussia','Epic',40,35,92,55],
+  ['Habsburg Austria','Epic',55,60,75,80],['Prussia','Epic',40,35,97,55],
   ['Portugal','Epic',80,55,45,70],['Sweden','Epic',45,50,70,60],
   ['Tokugawa Japan','Epic',35,15,65,10],['Maratha Confederacy','Epic',50,40,85,45],
   ['Mughal Empire','Epic',75,45,60,50],['Afsharid Persia','Epic',55,30,85,35],
@@ -81,6 +83,17 @@ const RAW = [
   ['Darfur Sultanate','Common',40,35,50,35],['Funj Sultanate','Common',45,40,45,40],
   ['Kingdom of Kaffa','Common',30,30,45,30],['Blackfoot Confederacy','Common',30,40,70,45],
   ['Apache','Common',20,20,85,25],
+  // --- 20 more countries of 1750 ---
+  ['Dzungar Khanate','Rare',40,20,88,25],['Lunda Empire','Rare',65,45,55,45],
+  ['Kokand Khanate','Uncommon',45,40,65,35],['Zaporozhian Cossacks','Uncommon',30,50,75,55],
+  ['Awadh','Uncommon',65,50,45,50],['Jaipur','Uncommon',55,50,45,55],
+  ['Bharatpur Jats','Uncommon',40,35,70,45],['Luba Empire','Uncommon',45,40,55,40],
+  ['Bambara Empire','Uncommon',45,35,70,35],['Sakalava Kingdom','Uncommon',45,40,55,35],
+  ['Futa Jallon','Uncommon',40,40,60,45],['Hausa City-States','Uncommon',70,45,40,40],
+  ['Johor Sultanate','Uncommon',70,50,40,45],['Sulu Sultanate','Uncommon',60,35,60,35],
+  ['Mrauk-U Arakan','Uncommon',55,35,55,35],['Nguyen Lords','Uncommon',50,35,60,35],
+  ['Hesse-Kassel','Uncommon',35,50,65,70],['Mossi Kingdoms','Common',30,40,60,40],
+  ['Kingdom of Rwanda','Common',25,30,65,30],['Duchy of Courland','Common',55,55,25,60],
 ];
 const COUNTRIES = RAW.map(([name, rarity, trade, sociable, war, allies]) => ({ name, rarity, trade, sociable, war, allies }));
 const BY_NAME = new Map(COUNTRIES.map(c => [c.name.toLowerCase(), c]));
@@ -147,11 +160,15 @@ function weightedCountry() {
   for (const [c, w] of pool) { if ((r -= w) <= 0) return c; }
   return COUNTRIES[0];
 }
-function bestWarCountry(u) {
+// Aggressive empires hit hard but defend worse: their War % is multiplied by this when they are attacked.
+// Add or change entries here (1 = normal defense, lower = weaker defense).
+const DEFENSE_MULT = { 'Prussia': 0.70, 'Russian Empire': 0.75, 'Ottoman Empire': 0.75 };
+const defMult = (c) => DEFENSE_MULT[c.name] ?? 1;
+function bestWarCountry(u, defending = false) {
   let best = null, score = -1;
   for (const [n, m] of Object.entries(u.countries)) {
     const c = BY_NAME.get(n.toLowerCase()); if (!c) continue;
-    const s = c.war * (0.5 + m / MAX_MASTERY);
+    const s = c.war * (defending ? defMult(c) : 1) * (0.5 + m / MAX_MASTERY);
     if (s > score) { score = s; best = { c, m }; }
   }
   return best;
@@ -199,14 +216,33 @@ const commands = [
     .addUserOption(o => o.setName('to').setDescription('Who receives it?').setRequired(true))
     .addStringOption(o => o.setName('country').setDescription('Country to give').setRequired(true).setAutocomplete(true)),
   new SlashCommandBuilder().setName('backup').setDescription('Admins only: save all player data now'),
+  new SlashCommandBuilder().setName('host').setDescription('Host only: country drops and minigames')
+    .addSubcommand(s => s.setName('now').setDescription('Drop a chosen country right now')
+      .addStringOption(o => o.setName('country').setDescription('Country to drop').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s => s.setName('next').setDescription('Choose the country of the next automatic drop')
+      .addStringOption(o => o.setName('country').setDescription('Country for the next drop').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s => s.setName('guess').setDescription('Number guessing game (60s). The winner gets the country')
+      .addIntegerOption(o => o.setName('number').setDescription('The secret number').setRequired(true).setMinValue(1))
+      .addStringOption(o => o.setName('country').setDescription('Prize country').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o => o.setName('max').setDescription('Highest possible number (default 100)').setMinValue(2)))
+    .addSubcommand(s => s.setName('quiz').setDescription('Question game (60s). The winner gets the country')
+      .addStringOption(o => o.setName('question').setDescription('The question').setRequired(true).setMaxLength(300))
+      .addStringOption(o => o.setName('answer').setDescription('The correct answer').setRequired(true).setMaxLength(100))
+      .addStringOption(o => o.setName('country').setDescription('Prize country').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s => s.setName('stop').setDescription('Cancel the running minigame')),
+  new SlashCommandBuilder().setName('guess').setDescription('Guess the number in the running game')
+    .addIntegerOption(o => o.setName('number').setDescription('Your guess').setRequired(true)),
+  new SlashCommandBuilder().setName('answer').setDescription('Answer the question in the running game')
+    .addStringOption(o => o.setName('text').setDescription('Your answer').setRequired(true).setMaxLength(100)),
 ].map(c => c.toJSON());
 
 /* ------------------------------ SPAWNING ------------------------------ */
 const spawns = new Map(); // messageId -> { country, claimedBy }
-async function spawnCountry() {
+async function spawnCountry(forced) {
   try {
     const channel = await client.channels.fetch(COUNTRY_CHANNEL_ID);
-    const c = weightedCountry();
+    // A country picked by the host (immediate drop, or queued for the next automatic drop) wins over the random pick
+    const c = (forced && forced.name ? forced : null) || forcedQueue.shift() || weightedCountry();
     const embed = new EmbedBuilder()
       .setColor(RARITY_COLOR[c.rarity])
       .setTitle(`A wild country appeared: ${c.name}`)
@@ -252,7 +288,7 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isAutocomplete()) return handleAutocomplete(i);
     if (i.isButton()) return handleButton(i);
     if (!i.isChatInputCommand()) return;
-    const handlers = { collection, leaderboard, farm, redeem, war, allies, faction, profile, trade, daily, give, backup };
+    const handlers = { collection, leaderboard, farm, redeem, war, allies, faction, profile, trade, daily, give, backup, host: hostCmd, guess: guessCmd, answer: answerCmd };
     await handlers[i.commandName]?.(i);
   } catch (e) {
     console.error(e);
@@ -266,7 +302,9 @@ function handleAutocomplete(i) {
   const q = f.value.toLowerCase();
   const u = U(i.user.id);
   let choices = [];
-  if (i.commandName === 'faction') {
+  if (i.commandName === 'host') {
+    choices = COUNTRIES.map(c => c.name);
+  } else if (i.commandName === 'faction') {
     choices = Object.values(db.factions).map(x => x.name);
   } else if (i.commandName === 'trade' && f.name === 'get') {
     const t = i.options.get('user')?.value;
@@ -280,7 +318,8 @@ function handleAutocomplete(i) {
 }
 
 async function handleButton(i) {
-  const [kind, id] = i.customId.split(':');
+  const [rawKind, id] = i.customId.split(':');
+  const kind = rawKind.split('_')[0]; // 'ally_yes' -> 'ally', 'trade_no' -> 'trade', 'claim' -> 'claim'
   if (kind === 'claim') {
     const s = spawns.get(i.message.id);
     if (!s) return i.reply({ content: 'These envoys already left.', ...eph });
@@ -411,7 +450,7 @@ async function war(i) {
     if (!n) return i.reply({ content: 'You do not own that country.', ...eph });
     att = { c: BY_NAME.get(n.toLowerCase()), m: a.countries[n] };
   } else att = bestWarCountry(a);
-  const def = bestWarCountry(d);
+  const def = bestWarCountry(d, true);
   if (!att) return i.reply({ content: 'You have no country to send to war.', ...eph });
   if (!def) return i.reply({ content: `${target.username} has no country to defend.`, ...eph });
 
@@ -421,8 +460,8 @@ async function war(i) {
     const f = u.faction && db.factions[u.faction]; if (f) s += Math.min(10, f.members.length * 2);
     return s;
   };
-  const power = (x, u) => x.c.war * (0.5 + x.m / MAX_MASTERY) + support(u) + rnd(0, 40);
-  const pa = power(att, a), pd = power(def, d);
+  const power = (x, u, defending) => x.c.war * (defending ? defMult(x.c) : 1) * (0.5 + x.m / MAX_MASTERY) + support(u) + rnd(0, 40);
+  const pa = power(att, a, false), pd = power(def, d, true);
   a.lastWar = Date.now();
   const won = pa > pd;
   const [wU, wC, lU, lC] = won ? [a, att, d, def] : [d, def, a, att];
@@ -585,13 +624,122 @@ async function give(i) {
   return i.reply({ embeds: [e] });
 }
 
+/* ------------------------------ HOST: DROPS & MINIGAMES ------------------------------ */
+let game = null;            // the running minigame, if any
+const forcedQueue = [];     // countries the host queued for the next automatic drops
+
+function grantCountry(userId, name) {
+  const u = U(userId);
+  if (u.countries[name] === undefined) { u.countries[name] = 0; return 'A new country joins your empire.'; }
+  u.countries[name] = Math.min(MAX_MASTERY, u.countries[name] + 5);
+  return 'You already had them, so they brought gifts: +5 mastery.';
+}
+const norm = (s) => s.toLowerCase().trim().replace(/\s+/g, ' ');
+
+// The host always owns every country at max mastery (re-applied at startup and every minute)
+function ensureHostMax() {
+  const u = U(HOST_ID); let changed = false;
+  for (const c of COUNTRIES) if (u.countries[c.name] !== MAX_MASTERY) { u.countries[c.name] = MAX_MASTERY; changed = true; }
+  if (changed) save();
+}
+
+async function startGame(g, embed) {
+  const channel = await client.channels.fetch(COUNTRY_CHANNEL_ID);
+  const mine = game = { ...g, last: new Map() };
+  mine.timer = setTimeout(() => {
+    if (game !== mine) return;
+    game = null;
+    const reveal = mine.type === 'guess' ? `The number was **${mine.answer}**.` : `The answer was **${mine.display}**.`;
+    channel.send({ embeds: [new EmbedBuilder().setColor(0xed4245).setTitle('Time is up!')
+      .setDescription(`${reveal}\nNobody won **${mine.country.name}**.`)] }).catch(() => {});
+  }, GAME_MS);
+  try { await channel.send({ embeds: [embed] }); }
+  catch (e) { clearTimeout(mine.timer); if (game === mine) game = null; throw e; }
+}
+
+async function hostCmd(i) {
+  if (i.user.id !== HOST_ID) return i.reply({ content: 'Only the host can use this command.', ...eph });
+  const sub = i.options.getSubcommand();
+
+  if (sub === 'stop') {
+    if (!game) return i.reply({ content: 'No game is running.', ...eph });
+    clearTimeout(game.timer); game = null;
+    return i.reply({ content: 'The game was cancelled.', ...eph });
+  }
+
+  const cName = i.options.getString('country');
+  const c = BY_NAME.get((cName || '').toLowerCase());
+  if (!c) return i.reply({ content: 'Unknown country. Pick one from the list.', ...eph });
+
+  if (sub === 'now') {
+    await i.deferReply(eph);
+    await spawnCountry(c);
+    return i.editReply(`**${c.name}** was dropped in the country channel.`);
+  }
+  if (sub === 'next') {
+    forcedQueue.push(c);
+    return i.reply({ content: `**${c.name}** will be the next automatic drop. Queue: ${forcedQueue.map(x => x.name).join(', ')}.`, ...eph });
+  }
+
+  // minigames
+  if (game) return i.reply({ content: 'A game is already running. Wait for it to end or use /host stop.', ...eph });
+  await i.deferReply(eph);
+  const prize = `**${c.name}** (${c.rarity})`;
+
+  if (sub === 'guess') {
+    const number = i.options.getInteger('number'); const max = i.options.getInteger('max') ?? 100;
+    if (number > max) return i.editReply(`The number must be between 1 and ${max}.`);
+    await startGame({ type: 'guess', answer: number, max, country: c },
+      new EmbedBuilder().setColor(RARITY_COLOR[c.rarity]).setTitle('Number guessing game!')
+        .setDescription(`I am thinking of a number between **1** and **${max}**.\nUse **/guess** to try. You get a hint after each guess.\n\nPrize: ${prize}\nYou have **60 seconds**.`));
+    return i.editReply(`Game started. Secret number: **${number}**. Prize: ${prize}.`);
+  }
+  if (sub === 'quiz') {
+    const q = i.options.getString('question'); const a = i.options.getString('answer');
+    await startGame({ type: 'quiz', answer: norm(a), display: a, country: c },
+      new EmbedBuilder().setColor(RARITY_COLOR[c.rarity]).setTitle('Question game!')
+        .setDescription(`**${q}**\n\nUse **/answer** to reply.\nPrize: ${prize}\nYou have **60 seconds**.`));
+    return i.editReply(`Game started. Answer: **${a}**. Prize: ${prize}.`);
+  }
+}
+
+async function winGame(i) {
+  const g = game; game = null; clearTimeout(g.timer);
+  const note = grantCountry(i.user.id, g.country.name); save();
+  const reveal = g.type === 'guess' ? `The number was **${g.answer}**.` : `The answer was **${g.display}**.`;
+  return i.reply({ embeds: [new EmbedBuilder().setColor(0x57f287).setTitle('We have a winner!')
+    .setDescription(`<@${i.user.id}> won **${g.country.name}**!\n${reveal}\n${note}`)] });
+}
+function gameGate(i, type) {
+  if (!game || game.type !== type) return i.reply({ content: `No ${type === 'guess' ? 'number' : 'question'} game is running right now.`, ...eph });
+  if (i.user.id === HOST_ID) return i.reply({ content: 'You are the host, you cannot play.', ...eph });
+  const last = game.last.get(i.user.id) || 0;
+  if (Date.now() - last < 2000) return i.reply({ content: 'Slow down a little.', ...eph });
+  game.last.set(i.user.id, Date.now());
+  return null;
+}
+async function guessCmd(i) {
+  const blocked = gameGate(i, 'guess'); if (blocked) return blocked;
+  const n = i.options.getInteger('number');
+  if (n < 1 || n > game.max) return i.reply({ content: `Pick a number between 1 and ${game.max}.`, ...eph });
+  if (n === game.answer) return winGame(i);
+  return i.reply({ content: n < game.answer ? `${n} is too low.` : `${n} is too high.`, ...eph });
+}
+async function answerCmd(i) {
+  const blocked = gameGate(i, 'quiz'); if (blocked) return blocked;
+  if (norm(i.options.getString('text')) === game.answer) return winGame(i);
+  return i.reply({ content: 'Not quite, try again.', ...eph });
+}
+
 /* ------------------------------ READY ------------------------------ */
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
   await restoreBackup();
+  ensureHostMax();
   try { const g = await client.guilds.fetch(GUILD_ID); await g.commands.set(commands); console.log('Slash commands registered.'); }
   catch (e) { console.error('Command registration failed:', e.message); }
   setInterval(() => doBackup(), BACKUP_MS);
+  setInterval(ensureHostMax, 60 * 1000);
   setTimeout(spawnCountry, 10000);
   setInterval(spawnCountry, SPAWN_MS);
 });
